@@ -1,0 +1,219 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper umum untuk autentikasi dan role.
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userDoc(uid) {
+      return get(/databases/$(database)/documents/users/$(uid));
+    }
+
+    function currentUserData() {
+      return userDoc(request.auth.uid).data;
+    }
+
+    function isAdmin() {
+      return signedIn() && currentUserData().role == 'admin';
+    }
+
+    function isCustomer() {
+      return signedIn() && currentUserData().role == 'customer';
+    }
+
+    function isTukang() {
+      return signedIn() && currentUserData().role == 'tukang';
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function bookingPath(bookingId) {
+      return /databases/$(database)/documents/bookings/$(bookingId);
+    }
+
+    function bookingData(bookingId) {
+      return get(bookingPath(bookingId)).data;
+    }
+
+    function isBookingCustomer(bookingId) {
+      return signedIn() && bookingData(bookingId).customerUid == request.auth.uid;
+    }
+
+    function isBookingTukang(bookingId) {
+      return signedIn() && bookingData(bookingId).tukangUid == request.auth.uid;
+    }
+
+    function isBookingParticipant(bookingId) {
+      return isBookingCustomer(bookingId) || isBookingTukang(bookingId);
+    }
+
+    // Data user: user hanya boleh membaca/mengubah dokumennya sendiri.
+    // Admin boleh membaca dan mengelola semua user.
+    // User biasa tidak boleh menaikkan role dirinya sendiri menjadi admin.
+    match /users/{uid} {
+      allow create: if isAdmin()
+        || (isOwner(uid)
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.role in ['customer', 'tukang']);
+      allow read: if isOwner(uid) || isAdmin();
+      allow update: if isAdmin()
+        || (isOwner(uid)
+          && request.resource.data.uid == resource.data.uid
+          && request.resource.data.role == resource.data.role);
+      allow delete: if isAdmin();
+    }
+
+    // Profil tukang: admin bisa mengelola semua profil.
+    // Tukang bisa membuat/mengubah profil miliknya, tetapi tidak boleh memverifikasi dirinya sendiri.
+    // Customer hanya bisa membaca profil tukang yang verified dan aktif.
+    match /tukangProfiles/{profileId} {
+      allow read: if isAdmin()
+        || (isTukang() && resource.data.uid == request.auth.uid)
+        || (isCustomer()
+          && resource.data.verificationStatus == 'verified'
+          && resource.data.activeStatus == true);
+
+      allow create: if isTukang()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.verificationStatus == 'pending'
+        && request.resource.data.activeStatus == false;
+
+      allow update: if isAdmin()
+        || (isTukang()
+          && resource.data.uid == request.auth.uid
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.verificationStatus == resource.data.verificationStatus
+          && request.resource.data.activeStatus == resource.data.activeStatus);
+
+      allow delete: if isAdmin();
+    }
+
+    // Kategori jasa: semua user login boleh membaca.
+    // Hanya admin yang boleh membuat, mengubah, dan menghapus kategori.
+    match /categories/{categoryId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // Layanan tukang: customer bisa membaca layanan dari tukang yang tersedia melalui aplikasi.
+    // Tukang hanya boleh mengelola layanan miliknya sendiri. Admin boleh mengelola semua.
+    match /services/{serviceId} {
+      allow read: if signedIn();
+      allow create: if isAdmin()
+        || (isTukang() && request.resource.data.tukangUid == request.auth.uid);
+      allow update: if isAdmin()
+        || (isTukang()
+          && resource.data.tukangUid == request.auth.uid
+          && request.resource.data.tukangUid == request.auth.uid);
+      allow delete: if isAdmin()
+        || (isTukang() && resource.data.tukangUid == request.auth.uid);
+    }
+
+    // Booking: customer boleh membuat booking atas nama dirinya sendiri dengan status pending.
+    // Customer bisa membaca booking miliknya, tukang bisa membaca booking yang ditujukan kepadanya.
+    // Tukang hanya boleh mengubah status booking yang ditujukan kepadanya, admin bisa mengelola semua.
+    match /bookings/{bookingId} {
+      allow create: if isCustomer()
+        && request.resource.data.customerUid == request.auth.uid
+        && request.resource.data.status == 'pending';
+
+      allow read: if isAdmin()
+        || resource.data.customerUid == request.auth.uid
+        || resource.data.tukangUid == request.auth.uid;
+
+      allow update: if isAdmin()
+        || (isTukang()
+          && resource.data.tukangUid == request.auth.uid
+          && request.resource.data.tukangUid == resource.data.tukangUid
+          && request.resource.data.customerUid == resource.data.customerUid
+          && request.resource.data.status in [
+            'accepted',
+            'rejected',
+            'in_progress',
+            'completed'
+          ]);
+
+      allow delete: if isAdmin();
+    }
+
+    // Review: customer hanya boleh membuat review untuk booking miliknya sendiri
+    // dan booking tersebut harus sudah completed. Admin dapat membaca/mengelola semua review.
+    match /reviews/{reviewId} {
+      allow create: if isCustomer()
+        && request.resource.data.customerUid == request.auth.uid
+        && exists(bookingPath(request.resource.data.bookingId))
+        && bookingData(request.resource.data.bookingId).customerUid == request.auth.uid
+        && bookingData(request.resource.data.bookingId).status == 'completed'
+        && request.resource.data.rating >= 1
+        && request.resource.data.rating <= 5;
+
+      allow read: if isAdmin()
+        || resource.data.customerUid == request.auth.uid
+        || resource.data.tukangUid == request.auth.uid;
+
+      allow update, delete: if isAdmin();
+    }
+
+    // Chat: customer dan tukang hanya boleh membaca/mengirim pesan
+    // pada booking yang memang terkait dengan mereka.
+    match /chats/{chatId} {
+      allow create: if signedIn()
+        && exists(bookingPath(request.resource.data.bookingId))
+        && isBookingParticipant(request.resource.data.bookingId)
+        && request.resource.data.senderUid == request.auth.uid
+        && (
+          (isBookingCustomer(request.resource.data.bookingId)
+            && request.resource.data.receiverUid == bookingData(request.resource.data.bookingId).tukangUid)
+          || (isBookingTukang(request.resource.data.bookingId)
+            && request.resource.data.receiverUid == bookingData(request.resource.data.bookingId).customerUid)
+        );
+
+      allow read: if signedIn()
+        && exists(bookingPath(resource.data.bookingId))
+        && isBookingParticipant(resource.data.bookingId);
+
+      allow update: if signedIn()
+        && resource.data.receiverUid == request.auth.uid
+        && request.resource.data.diff(resource.data).changedKeys().hasOnly(['readStatus']);
+
+      allow delete: if isAdmin();
+    }
+
+    // Notifikasi: user hanya boleh membaca notifikasi miliknya sendiri.
+    // Sistem aplikasi membuat notifikasi dari client sesuai flow booking/verifikasi;
+    // admin tetap dapat mengelola semua notifikasi.
+    match /notifications/{notificationId} {
+      allow create: if signedIn()
+        && request.resource.data.receiverUid is string
+        && request.resource.data.readStatus == false;
+
+      allow read: if isAdmin() || resource.data.receiverUid == request.auth.uid;
+
+      allow update: if isAdmin()
+        || (resource.data.receiverUid == request.auth.uid
+          && request.resource.data.diff(resource.data).changedKeys().hasOnly(['readStatus']));
+
+      allow delete: if isAdmin();
+    }
+
+    // Jadwal tukang: semua user login boleh membaca jadwal.
+    // Tukang hanya boleh mengelola jadwal miliknya sendiri.
+    match /schedules/{scheduleId} {
+      allow read: if signedIn();
+      allow create: if isTukang() && request.resource.data.tukangUid == request.auth.uid;
+      allow update: if isTukang()
+        && resource.data.tukangUid == request.auth.uid
+        && request.resource.data.tukangUid == request.auth.uid;
+      allow delete: if isTukang() && resource.data.tukangUid == request.auth.uid;
+    }
+
+    // Default deny: collection lain tidak boleh diakses jika belum dibuat rules khusus.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
