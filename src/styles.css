@@ -1914,7 +1914,7 @@ p {
 }
 
 .demo-accounts {
-  display: justify-content;
+  display: grid;
   width: 100%;
   min-height: 520px;
   align-content: start;
